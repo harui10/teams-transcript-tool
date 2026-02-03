@@ -20,7 +20,9 @@
         orderedKeys: [],
         scrollContainer: null,
         lastScrollTop: -1,
-        stuckCount: 0
+        stuckCount: 0,
+        currentSpeaker: '',  // 直前の話者を記憶
+        currentTime: ''      // 直前の時刻を記憶
     };
 
     // セレクタ候補（複数パターンを試す）
@@ -140,49 +142,109 @@
     // アイテムから情報を抽出
     function extractInfo(item) {
         const text = item.textContent || '';
-        const timePattern = /(\d{1,2}:\d{2})/;
+        // 時刻パターン（厳密）
+        const timePatternStrict = /^(\d{1,2}:\d{2})$/;
+        // 時刻パターン（緩め）- M:SS 形式
+        const timePatternLoose = /(\d{1,2}:\d{2})/;
+        // 時刻パターン（日本語形式）- "X 分間 Y 秒間" または "X 分 Y 秒"
+        const timePatternJapanese = /^\d{1,2}\s*分間?\s*\d{1,2}\s*秒間?$/;
+        // 時刻を含むテキストかどうか判定
+        const containsTime = (t) => timePatternLoose.test(t) || timePatternJapanese.test(t);
 
-        // 時刻を探す
         let time = '';
-        const timeMatch = text.match(timePattern);
-        if (timeMatch) {
-            time = timeMatch[1];
-        }
-
-        // 時刻要素を見つけて、その前後で話者と内容を分離
         let speaker = '';
         let content = '';
 
-        // 子要素を調べて構造を把握
-        const children = item.querySelectorAll('*');
-        children.forEach(child => {
+        // リーフノード（子要素を持たない要素）を収集
+        const leafNodes = [];
+        const allChildren = item.querySelectorAll('*');
+        allChildren.forEach(child => {
             if (child.children.length === 0) {
                 const childText = child.textContent.trim();
-
-                // 時刻要素
-                if (timePattern.test(childText) && childText.length < 10) {
-                    time = childText;
-                }
-                // 短いテキスト（話者名の可能性）
-                else if (childText.length > 0 && childText.length < 30 && !childText.includes(' ') === false) {
-                    // 日本語の名前パターン
-                    if (/^[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\s]+$/.test(childText) ||
-                        /^[A-Za-z\s]+$/.test(childText)) {
-                        if (!speaker) speaker = childText;
-                    }
-                }
-                // 長いテキスト（発言内容の可能性）
-                else if (childText.length > 10) {
-                    if (!content || childText.length > content.length) {
-                        content = childText;
-                    }
+                if (childText.length > 0) {
+                    leafNodes.push({
+                        element: child,
+                        text: childText
+                    });
                 }
             }
         });
 
-        // フォールバック: 全テキストから推測
+        // 各リーフノードを分類
+        const candidates = {
+            times: [],
+            speakers: [],
+            contents: []
+        };
+
+        leafNodes.forEach(node => {
+            const t = node.text;
+
+            // 時刻パターン（"MM:SS" または "X 分間 Y 秒間"）
+            if (timePatternStrict.test(t) || timePatternJapanese.test(t)) {
+                candidates.times.push(t);
+            }
+            // 短いテキスト（50文字未満で、時刻を含まない）→ 話者名候補
+            else if (t.length < 50 && !containsTime(t)) {
+                // 話者名として妥当かチェック（記号のみや空白のみでない）
+                if (/[^\s\-\.\,\!\?\(\)\[\]]+/.test(t)) {
+                    candidates.speakers.push(t);
+                }
+            }
+            // 長いテキスト → 発言内容
+            else if (t.length >= 10) {
+                candidates.contents.push(t);
+            }
+        });
+
+        // 時刻を決定（最初に見つかったもの）
+        if (candidates.times.length > 0) {
+            time = candidates.times[0];
+        } else {
+            // フォールバック：全テキストから時刻を抽出
+            const timeMatch = text.match(timePatternLoose);
+            if (timeMatch) {
+                time = timeMatch[1];
+            }
+        }
+
+        // 話者名を決定
+        // 最初に見つかった短いテキストで、内容と重複しないもの
+        for (const s of candidates.speakers) {
+            // 発言内容に含まれていない話者名を採用
+            const isPartOfContent = candidates.contents.some(c => c.includes(s));
+            if (!isPartOfContent) {
+                speaker = s;
+                break;
+            }
+        }
+
+        // 発言内容を決定（最も長いもの）
+        if (candidates.contents.length > 0) {
+            content = candidates.contents.reduce((a, b) => a.length > b.length ? a : b);
+        }
+
+        // フォールバック: 全テキストから話者名と時刻を除去
         if (!content) {
-            content = text.replace(time, '').replace(speaker, '').trim();
+            let remaining = text;
+            if (time) remaining = remaining.replace(time, '');
+            if (speaker) remaining = remaining.replace(speaker, '');
+            content = remaining.trim();
+        }
+
+        // デバッグ用：最初の数件だけログ出力
+        if (state.collected.size < 5) {
+            console.log('[抽出]', {
+                time,
+                speaker,
+                contentPreview: content.substring(0, 50),
+                leafCount: leafNodes.length,
+                candidates: {
+                    times: candidates.times,
+                    speakers: candidates.speakers.slice(0, 3),
+                    contentsCount: candidates.contents.length
+                }
+            });
         }
 
         // ユニークキーを生成（重複排除用）
@@ -221,6 +283,8 @@
         state.collected.clear();
         state.orderedKeys = [];
         state.stuckCount = 0;
+        state.currentSpeaker = '';
+        state.currentTime = '';
 
         updateStatus('開始: 一番上にスクロール中...', 'info');
 
@@ -228,8 +292,8 @@
         container.scrollTop = 0;
         await sleep(500);
 
-        const scrollStep = 150; // スクロール量（小さめに設定）
-        const waitTime = 300;   // 待機時間（長めに設定）
+        const scrollStep = 350; // スクロール量
+        const waitTime = 100;   // 待機時間
         let iteration = 0;
         const maxIterations = 1000; // 安全装置
 
@@ -242,6 +306,33 @@
 
             items.forEach(item => {
                 const info = extractInfo(item);
+
+                // 話者情報の引き継ぎ処理
+                const hasRealContent = info.content && info.content.trim().length > 0;
+                const hasSpeaker = info.speaker && info.speaker.trim().length > 0;
+                const hasTime = info.time && info.time.trim().length > 0;
+
+                // 話者・時刻のみのアイテム（発言内容がない）→ 話者情報を記憶
+                if ((hasSpeaker || hasTime) && !hasRealContent) {
+                    if (hasSpeaker) state.currentSpeaker = info.speaker;
+                    if (hasTime) state.currentTime = info.time;
+                    // このアイテムは保存しない（ヘッダーのみ）
+                    return;
+                }
+
+                // 発言内容があるが話者・時刻がない → 直前の話者情報を適用
+                if (hasRealContent) {
+                    if (!hasSpeaker && state.currentSpeaker) {
+                        info.speaker = state.currentSpeaker;
+                    }
+                    if (!hasTime && state.currentTime) {
+                        info.time = state.currentTime;
+                    }
+                    // 話者情報がある場合は更新
+                    if (hasSpeaker) state.currentSpeaker = info.speaker;
+                    if (hasTime) state.currentTime = info.time;
+                }
+
                 if (info.key && !state.collected.has(info.key)) {
                     state.collected.set(info.key, info);
                     state.orderedKeys.push(info.key);
